@@ -26,7 +26,15 @@ import fs from "node:fs";
 import PDFDocument from "pdfkit";
 import { Marked, type Token, type Tokens } from "marked";
 import SVGtoPDF from "svg-to-pdfkit";
-import { mathExtensions, renderMath, symbolTex, SYMBOL_RE, type MathToken } from "./md-math";
+import {
+  createMathRenderer,
+  mathExtensions,
+  symbolTex,
+  SYMBOL_RE,
+  type MathRenderer,
+  type MathToken,
+  type RenderedMath,
+} from "./md-math";
 import { normalizeMathDelimiters } from "./math-delimiters";
 
 /**
@@ -98,7 +106,7 @@ const LINE_GAP = 2.5;
 type PDFKitDoc = InstanceType<typeof PDFDocument>;
 
 /** Render context threaded through every block renderer. */
-type Ctx = { doc: PDFKitDoc; fonts: Fonts };
+type Ctx = { doc: PDFKitDoc; fonts: Fonts; math: MathRenderer };
 
 /** Inline run after emphasis/link nesting has been flattened to leaves. */
 type Segment = {
@@ -346,7 +354,7 @@ function emitSegments(ctx: Ctx, segs: Segment[], opts: EmitOpts): void {
 type Box =
   | { kind: "word"; seg: Segment; width: number }
   | { kind: "space"; width: number }
-  | { kind: "math"; tex: string; m: ReturnType<typeof renderMath>; display: boolean; width: number }
+  | { kind: "math"; tex: string; m: RenderedMath; display: boolean; width: number }
   | { kind: "break" };
 type LineBox = Exclude<Box, { kind: "break" }>;
 
@@ -361,7 +369,7 @@ function toBoxes(ctx: Ctx, segs: Segment[], size: number, color: string, maxWidt
   const boxes: Box[] = [];
   for (const seg of segs) {
     if (seg.math) {
-      const m = renderMath(seg.text, seg.math.display, size, color);
+      const m = ctx.math(seg.text, seg.math.display, size, color);
       const box: Box = { kind: "math", tex: seg.text, m, display: seg.math.display, width: m.width };
       if (seg.math.display) boxes.push({ kind: "break" }, box, { kind: "break" });
       else boxes.push(box);
@@ -770,7 +778,7 @@ export async function markdownToPdf(markdown: string): Promise<Buffer> {
     doc.on("error", reject);
   });
 
-  const ctx: Ctx = { doc, fonts: setUpFonts(doc, markdown) };
+  const ctx: Ctx = { doc, fonts: setUpFonts(doc, markdown), math: createMathRenderer() };
 
   doc.x = MARGIN;
   for (const token of tokens) renderBlock(ctx, token);

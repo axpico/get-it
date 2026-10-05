@@ -52,28 +52,50 @@ export type RenderedMath = { svg: string; width: number; ascent: number; descent
 
 const adaptor = liteAdaptor();
 RegisterHTMLHandler(adaptor);
-let texDoc: ReturnType<typeof mathjax.document> | null = null;
-// Documents repeat formulas (and symbols) constantly; typeset each once.
+/** Typeset `tex` at `size` pt. Bad TeX comes back as MathJax's red error box, never a throw. */
+export type MathRenderer = (tex: string, display: boolean, size: number, color: string) => RenderedMath;
+
+// Formulas that change what later TeX means (`\newcommand{\R}{…}`).
+const DEFINES_MACRO = /\\(?:(?:re)?newcommand|(?:re)?newenvironment|[gex]?def|let|DeclareMathOperator)\b/;
 // ponytail: cleared wholesale when full, an LRU if hit rates ever matter.
-const cache = new Map<string, RenderedMath>();
 const CACHE_MAX = 2000;
 
-/** Typeset `tex` at `size` pt. Bad TeX comes back as MathJax's red error box, never a throw. */
-export function renderMath(tex: string, display: boolean, size: number, color: string): RenderedMath {
-  const key = `${display ? "D" : "I"}|${size}|${color}|${tex}`;
-  const hit = cache.get(key);
-  if (hit) return hit;
-  if (cache.size >= CACHE_MAX) cache.clear();
-  const rendered = typeset(tex, display, size, color);
-  cache.set(key, rendered);
-  return rendered;
-}
-
-function typeset(tex: string, display: boolean, size: number, color: string): RenderedMath {
-  texDoc ??= mathjax.document("", {
+/**
+ * A renderer for one document. TeX macros defined with `\newcommand` persist
+ * inside a MathJax document, so each import gets its own: one student's
+ * macros never leak into another's file. Documents repeat formulas (and
+ * symbols) constantly, so results are cached, but a formula that defines a
+ * macro is never cached and drops the cache, since it can change what every
+ * later formula renders to.
+ */
+export function createMathRenderer(): MathRenderer {
+  const texDoc = mathjax.document("", {
     InputJax: new TeX({ packages: AllPackages }),
     OutputJax: new SVG({ fontCache: "none" }),
   });
+  const cache = new Map<string, RenderedMath>();
+  return (tex, display, size, color) => {
+    if (DEFINES_MACRO.test(tex)) {
+      cache.clear();
+      return typeset(texDoc, tex, display, size, color);
+    }
+    const key = `${display ? "D" : "I"}|${size}|${color}|${tex}`;
+    const hit = cache.get(key);
+    if (hit) return hit;
+    if (cache.size >= CACHE_MAX) cache.clear();
+    const rendered = typeset(texDoc, tex, display, size, color);
+    cache.set(key, rendered);
+    return rendered;
+  };
+}
+
+function typeset(
+  texDoc: ReturnType<typeof mathjax.document>,
+  tex: string,
+  display: boolean,
+  size: number,
+  color: string,
+): RenderedMath {
   const svgNode = adaptor.firstChild(texDoc.convert(tex, { display })) as Parameters<typeof adaptor.outerHTML>[0];
   // viewBox is in 1000ths of an em, with y = 0 on the baseline.
   const [, minY, w, h] = String(adaptor.getAttribute(svgNode, "viewBox")).split(/\s+/).map(Number);

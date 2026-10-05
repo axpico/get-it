@@ -15,6 +15,7 @@ import ReactMarkdown from "react-markdown";
 import { normalizeMathDelimiters as n } from "../lib/math-delimiters";
 import { remarkPlugins, rehypePlugins } from "../lib/markdown-math";
 import { markdownToPdf } from "../lib/md-to-pdf";
+import { createMathRenderer } from "../lib/md-math";
 import { extractPdf } from "../lib/pdf-extract";
 
 let failures = 0;
@@ -71,6 +72,21 @@ check("bad TeX renders an error, not a throw", html("$\\frac{a$").includes("kate
 check("one-line $$ $$ renders as display", html("$$\\frac{a}{b}$$").includes("katex-display"));
 check("currency stays text", !html("$20,000 and $30,000").includes("katex") && html("$20,000 and $30,000").includes("$20,000 and $30,000"));
 check("code stays code", !html("`\\(x\\)`").includes("katex") && html("`\\(x\\)`").includes("<code>\\(x\\)</code>"));
+
+// ── MathJax macro state ─────────────────────────────────────────────────
+{
+  const r = createMathRenderer();
+  const w = (tex: string) => r(tex, false, 10, "#000").width;
+  const undefinedFoo = w("\\foo");
+  w("\\newcommand{\\foo}{xxxxxxxx}");
+  const defined = w("\\foo");
+  w("\\renewcommand{\\foo}{x}");
+  const redefined = w("\\foo");
+  check("macros: a cached formula is re-typeset after \\newcommand", defined !== undefinedFoo, `${undefinedFoo} → ${defined}`);
+  check("macros: … and after \\renewcommand", redefined !== defined, `${defined} → ${redefined}`);
+  const other = createMathRenderer();
+  check("macros: one document's macros don't leak into another", other("\\foo", false, 10, "#000").width === undefinedFoo);
+}
 
 // ── Markdown → PDF import ───────────────────────────────────────────────
 async function pdfChecks() {
