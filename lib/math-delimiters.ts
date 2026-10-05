@@ -11,6 +11,17 @@
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])[ \t]/;
 
+/** Leading indentation in columns (tab = 4). */
+function indentOf(line: string): number {
+  let n = 0;
+  for (const ch of line) {
+    if (ch === " ") n++;
+    else if (ch === "\t") n += 4 - (n % 4);
+    else break;
+  }
+  return n;
+}
+
 export function normalizeMathDelimiters(md: string): string {
   let out = "";
   let prose: string[] = [];
@@ -22,9 +33,10 @@ export function normalizeMathDelimiters(md: string): string {
   let fence: string | null = null; // the open fence run, e.g. "```"
   let prevBlank = true;
   let inIndented = false;
-  // Inside a list, a 4-space indented line is the item's continuation
-  // paragraph, not code (CommonMark), so it stays prose.
-  let inList = false;
+  // Inside a list item, indented lines are the item's continuation
+  // paragraphs; only 4+ columns past the item's content indent is code
+  // (CommonMark). -1 = not in a list.
+  let listIndent = -1;
   for (const line of md.split(/(?<=\n)/)) {
     const blank = line.trim() === "";
     if (fence) {
@@ -34,12 +46,16 @@ export function normalizeMathDelimiters(md: string): string {
       continue;
     }
     const open = FENCE.exec(line);
+    const indent = indentOf(line);
+    const codeIndent = listIndent < 0 ? 4 : listIndent + 4;
     if (open) {
       flushProse();
       fence = open[1];
       out += line;
       inIndented = false;
-    } else if (!blank && !inList && (prevBlank || inIndented) && /^( {4}|\t)/.test(line)) {
+      // A fence left of the item's content ends the list.
+      if (indent < listIndent) listIndent = -1;
+    } else if (!blank && (prevBlank || inIndented) && indent >= codeIndent) {
       flushProse();
       out += line;
       inIndented = true;
@@ -47,8 +63,9 @@ export function normalizeMathDelimiters(md: string): string {
       out += line;
     } else {
       inIndented = false;
-      if (LIST_ITEM.test(line)) inList = true;
-      else if (!blank && !/^[ \t]/.test(line)) inList = false;
+      const item = LIST_ITEM.exec(line);
+      if (item) listIndent = item[0].length;
+      else if (!blank && indent === 0) listIndent = -1;
       prose.push(line);
     }
     prevBlank = blank;
@@ -125,7 +142,8 @@ function convertMath(s: string, startsLine: boolean, endsLine: boolean): string 
     while (a >= 0 && isBlank(s[a])) a--;
     let b = end;
     while (b < s.length && isBlank(s[b])) b++;
-    const ownLine = (a < 0 ? startsLine : s[a] === "\n") && (b >= s.length ? endsLine : s[b] === "\n");
+    const lineEnd = s[b] === "\n" || (s[b] === "\r" && s[b + 1] === "\n");
+    const ownLine = (a < 0 ? startsLine : s[a] === "\n") && (b >= s.length ? endsLine : lineEnd);
     return ownLine ? s.slice(a + 1, start) : null;
   };
   const fence = (tex: string, indent: string) => `$$\n${indent}${tex.trim()}\n${indent}$$`;

@@ -38,9 +38,9 @@ const mathInline: TokenizerExtension = {
   level: "inline",
   start: (src) => src.indexOf("$"),
   tokenizer(src): MathToken | undefined {
-    const d = /^\$\$([\s\S]+?)\$\$/.exec(src);
+    const d = /^\$\$([^`]+?)\$\$/.exec(src);
     if (d) return { type: "mathInline", raw: d[0], text: d[1].trim(), display: true };
-    const m = /^\$(?!\s)((?:\\.|[^\\$\n`])+?)\$(?!\d)/.exec(src);
+    const m = /^\$(?!\s)((?:\\.|[^\\$`])+?)\$(?!\d)/.exec(src);
     if (m) return { type: "mathInline", raw: m[0], text: m[1], display: false };
   },
 };
@@ -53,9 +53,23 @@ export type RenderedMath = { svg: string; width: number; ascent: number; descent
 const adaptor = liteAdaptor();
 RegisterHTMLHandler(adaptor);
 let texDoc: ReturnType<typeof mathjax.document> | null = null;
+// Documents repeat formulas (and symbols) constantly; typeset each once.
+// ponytail: cleared wholesale when full, an LRU if hit rates ever matter.
+const cache = new Map<string, RenderedMath>();
+const CACHE_MAX = 2000;
 
 /** Typeset `tex` at `size` pt. Bad TeX comes back as MathJax's red error box, never a throw. */
 export function renderMath(tex: string, display: boolean, size: number, color: string): RenderedMath {
+  const key = `${display ? "D" : "I"}|${size}|${color}|${tex}`;
+  const hit = cache.get(key);
+  if (hit) return hit;
+  if (cache.size >= CACHE_MAX) cache.clear();
+  const rendered = typeset(tex, display, size, color);
+  cache.set(key, rendered);
+  return rendered;
+}
+
+function typeset(tex: string, display: boolean, size: number, color: string): RenderedMath {
   texDoc ??= mathjax.document("", {
     InputJax: new TeX({ packages: AllPackages }),
     OutputJax: new SVG({ fontCache: "none" }),
@@ -104,7 +118,8 @@ const SYMBOL_TEX: Record<string, string> = {
   "Ξ": "\\Xi", "Π": "\\Pi", "Σ": "\\Sigma", "Υ": "\\Upsilon", "Φ": "\\Phi", "Ψ": "\\Psi", "Ω": "\\Omega",
 };
 
-export const SYMBOL_RE = new RegExp(`([${Object.keys(SYMBOL_TEX).join("")}])`, "u");
+/** Matches a run of adjacent symbols, so `→∞` becomes one formula, not two. */
+export const SYMBOL_RE = new RegExp(`([${Object.keys(SYMBOL_TEX).join("")}]+)`, "u");
 
-/** TeX for a symbol matched by `SYMBOL_RE`. */
-export const symbolTex = (ch: string): string => SYMBOL_TEX[ch];
+/** TeX for a run matched by `SYMBOL_RE`. */
+export const symbolTex = (run: string): string => Array.from(run, (ch) => SYMBOL_TEX[ch]).join(" ");

@@ -258,6 +258,7 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
       case "br":
         out.push({ text: "\n", bold: style.bold, italic: style.italic, mono: false });
         break;
+      case "mathBlock":
       case "mathInline": {
         const t = token as unknown as MathToken;
         out.push({ text: t.text, bold: false, italic: false, mono: false, math: { display: t.display } });
@@ -355,7 +356,7 @@ const TEXT_DESCENT = 0.25;
 /** Breathing room above and below a display formula. */
 const DISPLAY_PAD = 4;
 
-function toBoxes(ctx: Ctx, segs: Segment[], size: number, color: string): Box[] {
+function toBoxes(ctx: Ctx, segs: Segment[], size: number, color: string, maxWidth: number): Box[] {
   const { doc, fonts } = ctx;
   const boxes: Box[] = [];
   for (const seg of segs) {
@@ -370,11 +371,28 @@ function toBoxes(ctx: Ctx, segs: Segment[], size: number, color: string): Box[] 
     for (const part of seg.text.split(/(\n|[^\S\n]+)/)) {
       if (!part) continue;
       if (part === "\n") boxes.push({ kind: "break" });
-      else if (/^\s+$/.test(part)) boxes.push({ kind: "space", width: doc.widthOfString(" ") });
-      else boxes.push({ kind: "word", seg: { ...seg, text: part }, width: doc.widthOfString(part) });
+      // Code keeps its exact spacing; prose collapses runs to one space.
+      else if (/^\s+$/.test(part)) boxes.push({ kind: "space", width: doc.widthOfString(seg.mono ? part : " ") });
+      else for (const piece of fitWord(doc, part, maxWidth)) boxes.push({ kind: "word", seg: { ...seg, text: piece }, width: doc.widthOfString(piece) });
     }
   }
   return boxes;
+}
+
+/** Split a word wider than `maxWidth` (a long URL or identifier) into pieces that fit. */
+function fitWord(doc: PDFKitDoc, word: string, maxWidth: number): string[] {
+  if (doc.widthOfString(word) <= maxWidth) return [word];
+  const pieces: string[] = [];
+  let piece = "";
+  for (const ch of word) {
+    if (piece && doc.widthOfString(piece + ch) > maxWidth) {
+      pieces.push(piece);
+      piece = "";
+    }
+    piece += ch;
+  }
+  if (piece) pieces.push(piece);
+  return pieces;
 }
 
 /** Greedy line fill; spaces never start or end a line. */
@@ -411,12 +429,13 @@ function drawMath(doc: PDFKitDoc, box: Extract<Box, { kind: "math" }>, x: number
   SVGtoPDF(doc, m.svg, x, baseline - m.ascent * scale, { width: m.width * scale, height: h, assumePt: true });
   // Invisible TeX source over the formula, so `extractPdf` (and every agent
   // reading the document) still gets the math as text, not a blank gap.
+  const tex = box.tex.replace(/\s+/g, " ");
   doc.save().font("Helvetica").fontSize(1);
-  const fit = Math.min(BODY_SIZE, (m.width * scale) / Math.max(doc.widthOfString(box.tex), 0.01));
+  const fit = Math.min(BODY_SIZE, (m.width * scale) / Math.max(doc.widthOfString(tex), 0.01));
   doc
     .fillOpacity(0)
     .fontSize(fit)
-    .text(box.tex, x, baseline, { lineBreak: false, baseline: "alphabetic" })
+    .text(tex, x, baseline, { lineBreak: false, baseline: "alphabetic" })
     .restore();
 }
 
@@ -434,13 +453,14 @@ function measureLine(line: LineBox[], size: number, width: number) {
     }
   }
   // A formula wider than the column is shrunk to fit rather than clipped.
-  const scale = display && lineWidth > width ? width / lineWidth : 1;
+  // Words never overflow (toBoxes splits them), so only a lone formula can.
+  const scale = lineWidth > width ? width / lineWidth : 1;
   const pad = display ? DISPLAY_PAD : 0;
   return { display, ascent, lineWidth, scale, pad, height: (ascent + descent) * scale + LINE_GAP + pad * 2 };
 }
 
 function mathLines(ctx: Ctx, segs: Segment[], size: number, color: string, width: number): LineBox[][] {
-  return toLines(toBoxes(ctx, segs, size, color), width);
+  return toLines(toBoxes(ctx, segs, size, color, width), width);
 }
 
 function linesHeight(lines: LineBox[][], size: number, width: number): number {

@@ -46,6 +46,9 @@ eq("fenced code is untouched", n("```tex\n\\[x\\]\n```\n\\[y\\]"), "```tex\n\\[x
 eq("indented code is untouched", n("text\n\n    \\(x\\)\n\n\\(y\\)"), "text\n\n    \\(x\\)\n\n$y$");
 eq("indented list continuation is prose", n("- item\n\n    see \\(x\\)"), "- item\n\n    see $x$");
 eq("indented code after a paragraph is code", n("para\n\n    \\(x\\)"), "para\n\n    \\(x\\)");
+eq("CRLF display math on its own line", n("a\r\n\\[x\\]\r\nb"), "a\r\n$$\nx\n$$\r\nb");
+eq("code nested in a list item is code", n("- item\n\n      \\(x\\)"), "- item\n\n      \\(x\\)");
+eq("a top-level fence ends the list", n("- item\n\n```\nc\n```\n\n    \\(x\\)"), "- item\n\n```\nc\n```\n\n    \\(x\\)");
 eq("unclosed fence keeps the rest as code", n("````\n\\(x\\)\n```\n\\(y\\)"), "````\n\\(x\\)\n```\n\\(y\\)");
 
 // Many openers with no closer must stay linear (was quadratic as a regex).
@@ -103,19 +106,54 @@ async function pdfChecks() {
   check("PDF: price and code spans are not math", text.includes("$5") && text.includes("$code$"));
 }
 
+async function layoutChecks() {
+  const md = [
+    "x \\(a +",
+    "b\\) y",
+    "",
+    "- item",
+    "",
+    "  $$",
+    "  \\frac{1}{2}",
+    "  $$",
+    "",
+    "| a | b |",
+    "|---|---|",
+    `| https://example.com/${"a".repeat(150)} | right |`,
+  ].join("\n");
+  const pdf = await markdownToPdf(md);
+  const items = (await extractPdf(new Uint8Array(pdf))).pages.flatMap((p) => p.items);
+  const text = items.map((i) => i.str).join(" ");
+  // A typeset formula's TeX is the invisible text squeezed over the SVG,
+  // far smaller than body text; raw TeX printed as prose is full size.
+  const typeset = (tex: string) => items.some((i) => i.str.includes(tex) && i.height < 8);
+  // (Unconverted, it would print as literal "$a + b$".)
+  check("PDF: inline math across lines is typeset", text.includes("a + b") && !text.includes("$"), text.slice(0, 120));
+  check("PDF: display math inside a list item is typeset", typeset("\\frac{1}{2}"));
+  const col2 = 64 + (595.28 - 128) / 2;
+  const spill = items.filter((i) => i.x < col2 - 1 && i.x + i.width > col2 + 1);
+  check("PDF: a long word stays inside its table cell", spill.length === 0, spill.map((i) => i.str.slice(0, 30)).join(", "));
+}
+
 async function tallRowChecks() {
   const left = Array.from({ length: 600 }, (_, i) => `L${i} $x_{${i}}$`).join(" ");
   const right = Array.from({ length: 600 }, (_, i) => `R${i} words`).join(" ");
   const pdf = await markdownToPdf(`| a | b |\n|---|---|\n| ${left} | ${right} |\n`);
   const pages = (await extractPdf(new Uint8Array(pdf))).pages;
   check("PDF: a row taller than a page spans pages", pages.length > 1, `${pages.length} page(s)`);
-  const firstY = (re: RegExp) => pages[1]?.items.find((it) => re.test(it.str))?.y;
-  const yl = firstY(/\bL\d+/);
-  const yr = firstY(/\bR\d+/);
-  check("PDF: cells of a split row stay aligned", yl !== undefined && yr !== undefined && Math.abs(yl - yr) < 6, `left ${yl}, right ${yr}`);
+  // On every continuation page, both columns must resume at the same height.
+  const drift = pages.slice(1).map((p) => {
+    const yl = p.items.find((it) => /\bL\d+/.test(it.str))?.y;
+    const yr = p.items.find((it) => /\bR\d+/.test(it.str))?.y;
+    return yl === undefined || yr === undefined ? Infinity : Math.abs(yl - yr);
+  });
+  check("PDF: cells of a split row stay aligned on every page", drift.every((d) => d < 6), drift.join(", "));
+  const all = pages.flatMap((p) => p.items.map((i) => i.str)).join(" ");
+  check("PDF: a split row keeps its last lines", all.includes("L599") && /R599\b/.test(all));
 }
 
 pdfChecks()
+  .then(layoutChecks)
   .then(tallRowChecks)
   .catch((err) => check("PDF: renders without throwing", false, String(err)))
   .finally(() => {
