@@ -420,27 +420,41 @@ function drawMath(doc: PDFKitDoc, box: Extract<Box, { kind: "math" }>, x: number
     .restore();
 }
 
-function layoutWithMath(ctx: Ctx, segs: Segment[], opts: EmitOpts & { width: number }): void {
+/** Vertical metrics of one laid-out line. */
+function measureLine(line: LineBox[], size: number, width: number) {
+  const display = line.length === 1 && line[0].kind === "math" && line[0].display;
+  let ascent = size * TEXT_ASCENT;
+  let descent = size * TEXT_DESCENT;
+  let lineWidth = 0;
+  for (const b of line) {
+    lineWidth += b.width;
+    if (b.kind === "math") {
+      ascent = Math.max(ascent, b.m.ascent);
+      descent = Math.max(descent, b.m.descent);
+    }
+  }
+  // A formula wider than the column is shrunk to fit rather than clipped.
+  const scale = display && lineWidth > width ? width / lineWidth : 1;
+  const pad = display ? DISPLAY_PAD : 0;
+  return { display, ascent, lineWidth, scale, pad, height: (ascent + descent) * scale + LINE_GAP + pad * 2 };
+}
+
+function mathLines(ctx: Ctx, segs: Segment[], size: number, color: string, width: number): LineBox[][] {
+  return toLines(toBoxes(ctx, segs, size, color), width);
+}
+
+function linesHeight(lines: LineBox[][], size: number, width: number): number {
+  return lines.reduce((h, line) => h + measureLine(line, size, width).height, 0);
+}
+
+/** Draw pre-built lines starting at (doc.x, doc.y), breaking pages as needed. */
+function drawLines(ctx: Ctx, lines: LineBox[][], opts: EmitOpts & { width: number }): void {
   const { doc, fonts } = ctx;
   const { size, color, width } = opts;
   const left = doc.x;
   let y = doc.y;
-  for (const line of toLines(toBoxes(ctx, segs, size, color), width)) {
-    const display = line.length === 1 && line[0].kind === "math" && line[0].display;
-    let ascent = size * TEXT_ASCENT;
-    let descent = size * TEXT_DESCENT;
-    let lineWidth = 0;
-    for (const b of line) {
-      lineWidth += b.width;
-      if (b.kind === "math") {
-        ascent = Math.max(ascent, b.m.ascent);
-        descent = Math.max(descent, b.m.descent);
-      }
-    }
-    // A formula wider than the column is shrunk to fit rather than clipped.
-    const scale = display && lineWidth > width ? width / lineWidth : 1;
-    const pad = display ? DISPLAY_PAD : 0;
-    const height = (ascent + descent) * scale + LINE_GAP + pad * 2;
+  for (const line of lines) {
+    const { display, ascent, lineWidth, scale, pad, height } = measureLine(line, size, width);
     if (y + height > PAGE_BOTTOM) {
       doc.addPage();
       y = MARGIN;
@@ -468,6 +482,10 @@ function layoutWithMath(ctx: Ctx, segs: Segment[], opts: EmitOpts & { width: num
   }
   doc.x = left;
   doc.y = y + (opts.paragraphGap ?? 8);
+}
+
+function layoutWithMath(ctx: Ctx, segs: Segment[], opts: EmitOpts & { width: number }): void {
+  drawLines(ctx, mathLines(ctx, segs, opts.size, opts.color, opts.width), opts);
 }
 
 /** Add a page break before a block if it would otherwise be orphaned. */
@@ -580,28 +598,38 @@ function renderTable(ctx: Ctx, token: Tokens.Table): void {
   const cols = token.header.length;
   if (cols === 0) return;
   const colWidth = CONTENT_WIDTH / cols;
-  const cellText = (cell: Tokens.TableCell): string => {
-    const segs: Segment[] = [];
-    flattenInline(cell.tokens, BASE_STYLE, segs);
-    return segs.map((s) => s.text).join("");
-  };
+  const cellWidth = colWidth - 12;
   const drawRow = (cells: Tokens.TableCell[], header: boolean): void => {
     const font = header ? fonts.bold : fonts.regular;
     const color = header ? INK_500 : INK_700;
-    doc.font(font).fontSize(header ? 9 : 10);
-    const heights = cells.map((c) =>
-      doc.heightOfString(cellText(c), { width: colWidth - 12 }),
-    );
-    const rowHeight = Math.max(...heights, 14) + 8;
+    const size = header ? 9 : 10;
+    // Cells with math are pre-laid-out once, then measured and drawn from the
+    // same lines; plain cells keep pdfkit's own wrapping.
+    const laid = cells.map((cell) => {
+      const segs: Segment[] = [];
+      flattenInline(cell.tokens, BASE_STYLE, segs);
+      if (header) for (const s of segs) s.bold = true;
+      if (!segs.some((s) => s.math)) {
+        const text = segs.map((s) => s.text).join("");
+        return { text, height: doc.font(font).fontSize(size).heightOfString(text, { width: cellWidth }) };
+      }
+      const lines = mathLines(ctx, segs, size, color, cellWidth);
+      return { lines, height: linesHeight(lines, size, cellWidth) };
+    });
+    const rowHeight = Math.max(...laid.map((c) => c.height), 14) + 8;
     breakIfTight(doc, rowHeight);
     const top = doc.y;
-    cells.forEach((c, i) => {
-      doc
-        .font(font)
-        .fontSize(header ? 9 : 10)
-        .fillColor(color)
-        .text(cellText(c), MARGIN + i * colWidth, top + 4, { width: colWidth - 12 });
+    laid.forEach((c, i) => {
+      const x = MARGIN + i * colWidth;
+      if (c.lines) {
+        doc.x = x;
+        doc.y = top + 4;
+        drawLines(ctx, c.lines, { size, color, width: cellWidth, paragraphGap: 0 });
+      } else {
+        doc.font(font).fontSize(size).fillColor(color).text(c.text, x, top + 4, { width: cellWidth });
+      }
     });
+    doc.x = MARGIN;
     doc.y = top + rowHeight;
     doc
       .save()

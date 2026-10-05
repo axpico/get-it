@@ -80,6 +80,10 @@ async function pdfChecks() {
     "- broken $\\frac{a$",
     "",
     "Plain symbols x → ∞, ε > 0. ∎",
+    "",
+    "| $\\lim a_n$ | note |",
+    "|---|---|",
+    "| $\\pm\\infty$ | regola dei segni |",
   ].join("\n");
   const pdf = await markdownToPdf(md);
   const text = (await extractPdf(new Uint8Array(pdf))).pages
@@ -91,6 +95,7 @@ async function pdfChecks() {
   check("PDF: no raw $$ delimiters left", !text.includes("$$"));
   check("PDF: prose around math survives", ["Siano", "Allora", "Posto", "bold", "link", "item with"].every((w) => text.includes(w)));
   check("PDF: plain-text math symbols are typeset", ["\\to", "\\infty", "\\varepsilon", "\\blacksquare"].every((t) => text.includes(t)));
+  check("PDF: table cells are typeset", text.includes("\\lim a_n") && text.includes("\\pm\\infty") && text.includes("regola dei segni"));
   check("PDF: price and code spans are not math", text.includes("$5") && text.includes("$code$"));
 }
 
