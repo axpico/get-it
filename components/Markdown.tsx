@@ -1,10 +1,9 @@
 "use client";
 
 import ReactMarkdown, { type Options } from "react-markdown";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import "katex/dist/katex.min.css";
 import { normalizeMathDelimiters } from "@/lib/math-delimiters";
+import { remarkPlugins, rehypePlugins } from "@/lib/markdown-math";
 
 type Props = Omit<Options, "children" | "remarkPlugins" | "rehypePlugins"> & {
   children: string;
@@ -15,8 +14,8 @@ export default function Markdown({ children, ...props }: Props) {
   return (
     <ReactMarkdown
       {...props}
-      remarkPlugins={[remarkMath]}
-      rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
     >
       {normalizeMathDelimiters(children)}
     </ReactMarkdown>

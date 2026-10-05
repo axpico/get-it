@@ -1,32 +1,105 @@
 /**
- * Behavior tests for LaTeX delimiter normalization (lib/math-delimiters.ts).
+ * Behavior tests for LaTeX math rendering.
+ *
+ *  - lib/math-delimiters.ts: `\(…\)` / `\[…\]` normalization
+ *  - the chat / 2D-text render path (react-markdown + remark-math + KaTeX)
+ *  - lib/md-to-pdf.ts: math in imported Markdown is typeset, and its TeX
+ *    source is still extractable as text for the agents
  *
  * Run: npx tsx scripts/test-math.ts
  */
 
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import ReactMarkdown from "react-markdown";
 import { normalizeMathDelimiters as n } from "../lib/math-delimiters";
+import { remarkPlugins, rehypePlugins } from "../lib/markdown-math";
+import { markdownToPdf } from "../lib/md-to-pdf";
+import { extractPdf } from "../lib/pdf-extract";
 
 let failures = 0;
-function check(name: string, actual: string, expected: string) {
-  const ok = actual === expected;
-  if (!ok) failures++;
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${ok ? "" : `  — got ${JSON.stringify(actual)}`}`);
+function check(name: string, cond: boolean, detail?: string) {
+  if (!cond) failures++;
+  console.log(`${cond ? "PASS" : "FAIL"}  ${name}${cond || !detail ? "" : `  — ${detail}`}`);
+}
+function eq(name: string, actual: string, expected: string) {
+  check(name, actual === expected, `got ${JSON.stringify(actual)}`);
 }
 
-check("inline \\( \\) becomes $ $", n("so \\(x^2\\) grows"), "so $x^2$ grows");
-check("display \\[ \\] becomes $$ $$", n("\\[\\frac{a}{b}\\]"), "$$\\frac{a}{b}$$");
-check("multiline display", n("\\[\na + b\n\\]"), "$$\na + b\n$$");
-check("dollar math is untouched", n("$a$ and $$b$$"), "$a$ and $$b$$");
-check("inline code is untouched", n("`\\(x\\)` vs \\(y\\)"), "`\\(x\\)` vs $y$");
-check(
-  "fenced code is untouched",
-  n("```tex\n\\[x\\]\n```\n\\[y\\]"),
-  "```tex\n\\[x\\]\n```\n$$y$$",
-);
-check("plain text is untouched", n("no math here (really)"), "no math here (really)");
+// ── Delimiter normalization ─────────────────────────────────────────────
+eq("inline \\( \\) becomes $ $", n("so \\(x^2\\) grows"), "so $x^2$ grows");
+eq("display \\[ \\] on its own line becomes a $$ block", n("\\[\\frac{a}{b}\\]"), "$$\n\\frac{a}{b}\n$$");
+eq("mid-line \\[ \\] becomes $$ $$", n("so \\[x\\] here"), "so $$x$$ here");
+eq("one-line $$ $$ on its own line becomes a block", n("a\n$$x$$\nb"), "a\n$$\nx\n$$\nb");
+eq("display block keeps list indentation", n("- item\n  \\[x\\]"), "- item\n  $$\n  x\n  $$");
+eq("display next to inline code stays inline", n("`c` \\[x\\]"), "`c` $$x$$");
+eq("currency is escaped, not math", n("$20,000 and $30,000"), "\\$20,000 and \\$30,000");
+eq("a lone $ is escaped", n("costs $5 total"), "costs \\$5 total");
+eq("math next to currency", n("$x$ costs $5"), "$x$ costs \\$5");
+eq("multiline display", n("\\[\na + b\n\\]"), "$$\na + b\n$$");
+eq("dollar math is untouched", n("$a$ and $$b$$"), "$a$ and $$b$$");
+eq("plain text is untouched", n("no math here (really)"), "no math here (really)");
+eq("escaped backslash is not a delimiter", n("a \\\\(b) c"), "a \\\\(b) c");
+eq("inline code is untouched", n("`\\(x\\)` vs \\(y\\)"), "`\\(x\\)` vs $y$");
+eq("double-backtick code is untouched", n("``a ` \\(x\\)`` vs \\(y\\)"), "``a ` \\(x\\)`` vs $y$");
+eq("fenced code is untouched", n("```tex\n\\[x\\]\n```\n\\[y\\]"), "```tex\n\\[x\\]\n```\n$$\ny\n$$");
+eq("indented code is untouched", n("text\n\n    \\(x\\)\n\n\\(y\\)"), "text\n\n    \\(x\\)\n\n$y$");
+eq("unclosed fence keeps the rest as code", n("````\n\\(x\\)\n```\n\\(y\\)"), "````\n\\(x\\)\n```\n\\(y\\)");
 
-if (failures) {
-  console.log(`\n${failures} failure(s)`);
-  process.exit(1);
+// Many openers with no closer must stay linear (was quadratic as a regex).
+const hostile = "\\( \\[ ` $$ ".repeat(50_000);
+const t0 = performance.now();
+const out = n(hostile);
+const ms = performance.now() - t0;
+check("unmatched openers stay fast", out.length >= hostile.length && ms < 500, `${ms.toFixed(0)} ms`);
+
+// ── Chat / 2D text render path ──────────────────────────────────────────
+const html = (md: string) =>
+  renderToStaticMarkup(createElement(ReactMarkdown, { remarkPlugins, rehypePlugins }, n(md)));
+
+check("$…$ renders KaTeX", html("so $x^2$ grows").includes('class="katex"'));
+check("\\(…\\) renders KaTeX", html("so \\(x^2\\) grows").includes('class="katex"'));
+check("\\[…\\] renders display KaTeX", html("\\[\\frac{a}{b}\\]").includes("katex-display"));
+check("bad TeX renders an error, not a throw", html("$\\frac{a$").includes("katex-error"));
+check("one-line $$ $$ renders as display", html("$$\\frac{a}{b}$$").includes("katex-display"));
+check("currency stays text", !html("$20,000 and $30,000").includes("katex") && html("$20,000 and $30,000").includes("$20,000 and $30,000"));
+check("code stays code", !html("`\\(x\\)`").includes("katex") && html("`\\(x\\)`").includes("<code>\\(x\\)</code>"));
+
+// ── Markdown → PDF import ───────────────────────────────────────────────
+async function pdfChecks() {
+  const md = [
+    "# Limits",
+    "",
+    "Siano $a_n=\\dfrac{(-1)^n}{n}$ e $b_n\\to0$. Allora",
+    "$$",
+    "\\lim_{n\\to\\infty}\\frac{a_n}{b_n}",
+    "$$",
+    "Posto \\(c_n\\): **bold** and a [link](https://example.com), price $5 and `$code$`.",
+    "",
+    "- item with $\\sqrt{x^2+1}$",
+    "- broken $\\frac{a$",
+    "",
+    "Plain symbols x → ∞, ε > 0. ∎",
+  ].join("\n");
+  const pdf = await markdownToPdf(md);
+  const text = (await extractPdf(new Uint8Array(pdf))).pages
+    .flatMap((p) => p.items.map((i) => i.str))
+    .join(" ");
+  check("PDF: inline TeX source is extractable", text.includes("a_n=\\dfrac{(-1)^n}{n}"), text.slice(0, 200));
+  check("PDF: display TeX source is extractable", text.includes("\\lim_{n\\to\\infty}\\frac{a_n}{b_n}"));
+  check("PDF: \\(…\\) math is typeset too", text.includes("c_n") && !text.includes("\\(c_n"));
+  check("PDF: no raw $$ delimiters left", !text.includes("$$"));
+  check("PDF: prose around math survives", ["Siano", "Allora", "Posto", "bold", "link", "item with"].every((w) => text.includes(w)));
+  check("PDF: plain-text math symbols are typeset", ["\\to", "\\infty", "\\varepsilon", "\\blacksquare"].every((t) => text.includes(t)));
+  check("PDF: price and code spans are not math", text.includes("$5") && text.includes("$code$"));
 }
-console.log("\nall passed");
+
+pdfChecks()
+  .catch((err) => check("PDF: renders without throwing", false, String(err)))
+  .finally(() => {
+    if (failures) {
+      console.log(`\n${failures} failure(s)`);
+      process.exit(1);
+    }
+    console.log("\nall passed");
+  });

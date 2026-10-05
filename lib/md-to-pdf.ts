@@ -24,7 +24,10 @@
 
 import fs from "node:fs";
 import PDFDocument from "pdfkit";
-import { marked, type Token, type Tokens } from "marked";
+import { Marked, type Token, type Tokens } from "marked";
+import SVGtoPDF from "svg-to-pdfkit";
+import { mathExtensions, renderMath, symbolTex, SYMBOL_RE, type MathToken } from "./md-math";
+import { normalizeMathDelimiters } from "./math-delimiters";
 
 /**
  * Reject absurdly large markdown before we spend time rendering it. The
@@ -104,6 +107,8 @@ type Segment = {
   italic: boolean;
   mono: boolean;
   link?: string;
+  /** Set on LaTeX runs; `text` then holds the TeX source. */
+  math?: { display: boolean };
 };
 
 type Style = { bold: boolean; italic: boolean };
@@ -221,7 +226,7 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
       case "text": {
         const t = token as Tokens.Text;
         if (t.tokens && t.tokens.length) flattenInline(t.tokens, style, out);
-        else out.push({ text: decodeEntities(t.text), bold: style.bold, italic: style.italic, mono: false });
+        else pushProse(decodeEntities(t.text), style, out);
         break;
       }
       case "escape": {
@@ -253,6 +258,11 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
       case "br":
         out.push({ text: "\n", bold: style.bold, italic: style.italic, mono: false });
         break;
+      case "mathInline": {
+        const t = token as unknown as MathToken;
+        out.push({ text: t.text, bold: false, italic: false, mono: false, math: { display: t.display } });
+        break;
+      }
       case "image": {
         // We can't lay out images with the standard pipeline; keep the alt
         // text so the document still reads and the detector has something.
@@ -266,6 +276,15 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
       }
     }
   }
+}
+
+/** Push prose, splitting out math symbols the PDF fonts can't encode as tiny formulas. */
+function pushProse(text: string, style: Style, out: Segment[]): void {
+  text.split(SYMBOL_RE).forEach((part, i) => {
+    if (!part) return;
+    if (i % 2 === 1) out.push({ text: symbolTex(part), bold: false, italic: false, mono: false, math: { display: false } });
+    else out.push({ text: part, bold: style.bold, italic: style.italic, mono: false });
+  });
 }
 
 function fontFor(seg: Segment, fonts: Fonts): string {
@@ -292,6 +311,10 @@ function emitSegments(ctx: Ctx, segs: Segment[], opts: EmitOpts): void {
     doc.text(" ", { width });
     return;
   }
+  if (segs.some((s) => s.math)) {
+    layoutWithMath(ctx, segs, { ...opts, width });
+    return;
+  }
   const last = segs.length - 1;
   segs.forEach((seg, i) => {
     doc
@@ -310,6 +333,141 @@ function emitSegments(ctx: Ctx, segs: Segment[], opts: EmitOpts): void {
     }
     doc.text(seg.text, textOpts);
   });
+}
+
+// ── Math-aware inline layout ────────────────────────────────────────────
+// pdfkit's text flow can't carry an embedded graphic, so a paragraph that
+// contains math is laid out by hand: words and typeset formulas become boxes,
+// lines are filled greedily, and every box on a line shares one baseline.
+// Display math gets a centred line of its own. Paragraphs without math keep
+// the simpler pdfkit flow in `emitSegments`.
+
+type Box =
+  | { kind: "word"; seg: Segment; width: number }
+  | { kind: "space"; width: number }
+  | { kind: "math"; tex: string; m: ReturnType<typeof renderMath>; display: boolean; width: number }
+  | { kind: "break" };
+type LineBox = Exclude<Box, { kind: "break" }>;
+
+/** Text ascent/descent as fractions of the font size (Helvetica-ish). */
+const TEXT_ASCENT = 0.75;
+const TEXT_DESCENT = 0.25;
+/** Breathing room above and below a display formula. */
+const DISPLAY_PAD = 4;
+
+function toBoxes(ctx: Ctx, segs: Segment[], size: number, color: string): Box[] {
+  const { doc, fonts } = ctx;
+  const boxes: Box[] = [];
+  for (const seg of segs) {
+    if (seg.math) {
+      const m = renderMath(seg.text, seg.math.display, size, color);
+      const box: Box = { kind: "math", tex: seg.text, m, display: seg.math.display, width: m.width };
+      if (seg.math.display) boxes.push({ kind: "break" }, box, { kind: "break" });
+      else boxes.push(box);
+      continue;
+    }
+    doc.font(fontFor(seg, fonts)).fontSize(size);
+    for (const part of seg.text.split(/(\n|[^\S\n]+)/)) {
+      if (!part) continue;
+      if (part === "\n") boxes.push({ kind: "break" });
+      else if (/^\s+$/.test(part)) boxes.push({ kind: "space", width: doc.widthOfString(" ") });
+      else boxes.push({ kind: "word", seg: { ...seg, text: part }, width: doc.widthOfString(part) });
+    }
+  }
+  return boxes;
+}
+
+/** Greedy line fill; spaces never start or end a line. */
+function toLines(boxes: Box[], width: number): LineBox[][] {
+  const lines: LineBox[][] = [];
+  let line: LineBox[] = [];
+  let used = 0;
+  const flush = () => {
+    while (line.length && line[line.length - 1].kind === "space") line.pop();
+    if (line.length) lines.push(line);
+    line = [];
+    used = 0;
+  };
+  for (const box of boxes) {
+    if (box.kind === "break") {
+      flush();
+      continue;
+    }
+    if (box.kind === "space" && line.length === 0) continue;
+    if (used + box.width > width && line.length > 0) {
+      flush();
+      if (box.kind === "space") continue;
+    }
+    line.push(box);
+    used += box.width;
+  }
+  flush();
+  return lines;
+}
+
+function drawMath(doc: PDFKitDoc, box: Extract<Box, { kind: "math" }>, x: number, baseline: number, scale: number): void {
+  const { m } = box;
+  const h = (m.ascent + m.descent) * scale;
+  SVGtoPDF(doc, m.svg, x, baseline - m.ascent * scale, { width: m.width * scale, height: h, assumePt: true });
+  // Invisible TeX source over the formula, so `extractPdf` (and every agent
+  // reading the document) still gets the math as text, not a blank gap.
+  doc.save().font("Helvetica").fontSize(1);
+  const fit = Math.min(BODY_SIZE, (m.width * scale) / Math.max(doc.widthOfString(box.tex), 0.01));
+  doc
+    .fillOpacity(0)
+    .fontSize(fit)
+    .text(box.tex, x, baseline, { lineBreak: false, baseline: "alphabetic" })
+    .restore();
+}
+
+function layoutWithMath(ctx: Ctx, segs: Segment[], opts: EmitOpts & { width: number }): void {
+  const { doc, fonts } = ctx;
+  const { size, color, width } = opts;
+  const left = doc.x;
+  let y = doc.y;
+  for (const line of toLines(toBoxes(ctx, segs, size, color), width)) {
+    const display = line.length === 1 && line[0].kind === "math" && line[0].display;
+    let ascent = size * TEXT_ASCENT;
+    let descent = size * TEXT_DESCENT;
+    let lineWidth = 0;
+    for (const b of line) {
+      lineWidth += b.width;
+      if (b.kind === "math") {
+        ascent = Math.max(ascent, b.m.ascent);
+        descent = Math.max(descent, b.m.descent);
+      }
+    }
+    // A formula wider than the column is shrunk to fit rather than clipped.
+    const scale = display && lineWidth > width ? width / lineWidth : 1;
+    const pad = display ? DISPLAY_PAD : 0;
+    const height = (ascent + descent) * scale + LINE_GAP + pad * 2;
+    if (y + height > PAGE_BOTTOM) {
+      doc.addPage();
+      y = MARGIN;
+    }
+    const baseline = y + pad + ascent * scale;
+    let x = display ? left + (width - lineWidth * scale) / 2 : left;
+    for (const b of line) {
+      if (b.kind === "math") drawMath(doc, b, x, baseline, scale);
+      else if (b.kind === "word") {
+        doc
+          .font(fontFor(b.seg, fonts))
+          .fontSize(size)
+          .fillColor(b.seg.link ? ACCENT : color)
+          .text(b.seg.text, x, baseline, { lineBreak: false, baseline: "alphabetic" });
+        // pdfkit's own `link`/`underline` options need a wrapping width; with
+        // hand placement we draw both from the measured box instead.
+        if (b.seg.link) {
+          doc.link(x, baseline - size * TEXT_ASCENT, b.width, size, b.seg.link);
+          doc.save().lineWidth(0.6).strokeColor(ACCENT).moveTo(x, baseline + 1.5).lineTo(x + b.width, baseline + 1.5).stroke().restore();
+        }
+      }
+      x += b.width * scale;
+    }
+    y += height;
+  }
+  doc.x = left;
+  doc.y = y + (opts.paragraphGap ?? 8);
 }
 
 /** Add a page break before a block if it would otherwise be orphaned. */
@@ -497,6 +655,13 @@ function renderBlock(ctx: Ctx, token: Token): void {
     case "hr":
       renderHr(ctx.doc);
       break;
+    case "mathBlock":
+      emitSegments(ctx, [{ text: (token as unknown as MathToken).text, bold: false, italic: false, mono: false, math: { display: true } }], {
+        size: BODY_SIZE,
+        color: INK_700,
+        paragraphGap: 8,
+      });
+      break;
     case "space":
       ctx.doc.moveDown(0.4);
       break;
@@ -528,7 +693,7 @@ export async function markdownToPdf(markdown: string): Promise<Buffer> {
     throw new MarkdownEmptyError();
   }
 
-  const tokens = marked.lexer(markdown, { gfm: true });
+  const tokens = new Marked({ gfm: true, extensions: mathExtensions }).lexer(normalizeMathDelimiters(markdown));
 
   const doc = new PDFDocument({
     size: "A4",
