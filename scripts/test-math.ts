@@ -44,14 +44,18 @@ eq("inline code is untouched", n("`\\(x\\)` vs \\(y\\)"), "`\\(x\\)` vs $y$");
 eq("double-backtick code is untouched", n("``a ` \\(x\\)`` vs \\(y\\)"), "``a ` \\(x\\)`` vs $y$");
 eq("fenced code is untouched", n("```tex\n\\[x\\]\n```\n\\[y\\]"), "```tex\n\\[x\\]\n```\n$$\ny\n$$");
 eq("indented code is untouched", n("text\n\n    \\(x\\)\n\n\\(y\\)"), "text\n\n    \\(x\\)\n\n$y$");
+eq("indented list continuation is prose", n("- item\n\n    see \\(x\\)"), "- item\n\n    see $x$");
+eq("indented code after a paragraph is code", n("para\n\n    \\(x\\)"), "para\n\n    \\(x\\)");
 eq("unclosed fence keeps the rest as code", n("````\n\\(x\\)\n```\n\\(y\\)"), "````\n\\(x\\)\n```\n\\(y\\)");
 
 // Many openers with no closer must stay linear (was quadratic as a regex).
-const hostile = "\\( \\[ ` $$ ".repeat(50_000);
+// The old regex took minutes on this; a linear pass takes milliseconds, so
+// the generous cap catches a quadratic regression without flaking on slow CI.
+const hostile = "\\( \\[ ` $$ ".repeat(200_000);
 const t0 = performance.now();
 const out = n(hostile);
 const ms = performance.now() - t0;
-check("unmatched openers stay fast", out.length >= hostile.length && ms < 500, `${ms.toFixed(0)} ms`);
+check("unmatched openers stay fast", out.length >= hostile.length && ms < 3000, `${ms.toFixed(0)} ms`);
 
 // ── Chat / 2D text render path ──────────────────────────────────────────
 const html = (md: string) =>
@@ -99,7 +103,20 @@ async function pdfChecks() {
   check("PDF: price and code spans are not math", text.includes("$5") && text.includes("$code$"));
 }
 
+async function tallRowChecks() {
+  const left = Array.from({ length: 600 }, (_, i) => `L${i} $x_{${i}}$`).join(" ");
+  const right = Array.from({ length: 600 }, (_, i) => `R${i} words`).join(" ");
+  const pdf = await markdownToPdf(`| a | b |\n|---|---|\n| ${left} | ${right} |\n`);
+  const pages = (await extractPdf(new Uint8Array(pdf))).pages;
+  check("PDF: a row taller than a page spans pages", pages.length > 1, `${pages.length} page(s)`);
+  const firstY = (re: RegExp) => pages[1]?.items.find((it) => re.test(it.str))?.y;
+  const yl = firstY(/\bL\d+/);
+  const yr = firstY(/\bR\d+/);
+  check("PDF: cells of a split row stay aligned", yl !== undefined && yr !== undefined && Math.abs(yl - yr) < 6, `left ${yl}, right ${yr}`);
+}
+
 pdfChecks()
+  .then(tallRowChecks)
   .catch((err) => check("PDF: renders without throwing", false, String(err)))
   .finally(() => {
     if (failures) {

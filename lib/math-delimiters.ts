@@ -9,6 +9,7 @@
  */
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])[ \t]/;
 
 export function normalizeMathDelimiters(md: string): string {
   let out = "";
@@ -21,6 +22,9 @@ export function normalizeMathDelimiters(md: string): string {
   let fence: string | null = null; // the open fence run, e.g. "```"
   let prevBlank = true;
   let inIndented = false;
+  // Inside a list, a 4-space indented line is the item's continuation
+  // paragraph, not code (CommonMark), so it stays prose.
+  let inList = false;
   for (const line of md.split(/(?<=\n)/)) {
     const blank = line.trim() === "";
     if (fence) {
@@ -35,7 +39,7 @@ export function normalizeMathDelimiters(md: string): string {
       fence = open[1];
       out += line;
       inIndented = false;
-    } else if (!blank && (prevBlank || inIndented) && /^( {4}|\t)/.test(line)) {
+    } else if (!blank && !inList && (prevBlank || inIndented) && /^( {4}|\t)/.test(line)) {
       flushProse();
       out += line;
       inIndented = true;
@@ -43,6 +47,8 @@ export function normalizeMathDelimiters(md: string): string {
       out += line;
     } else {
       inIndented = false;
+      if (LIST_ITEM.test(line)) inList = true;
+      else if (!blank && !/^[ \t]/.test(line)) inList = false;
       prose.push(line);
     }
     prevBlank = blank;

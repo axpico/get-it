@@ -245,7 +245,7 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
         break;
       case "codespan": {
         const t = token as Tokens.Codespan;
-        out.push({ text: decodeEntities(t.text), bold: style.bold, italic: style.italic, mono: true });
+        pushProse(decodeEntities(t.text), style, out, true);
         break;
       }
       case "link": {
@@ -279,11 +279,11 @@ function flattenInline(tokens: Token[] | undefined, style: Style, out: Segment[]
 }
 
 /** Push prose, splitting out math symbols the PDF fonts can't encode as tiny formulas. */
-function pushProse(text: string, style: Style, out: Segment[]): void {
+function pushProse(text: string, style: Style, out: Segment[], mono = false): void {
   text.split(SYMBOL_RE).forEach((part, i) => {
     if (!part) return;
     if (i % 2 === 1) out.push({ text: symbolTex(part), bold: false, italic: false, mono: false, math: { display: false } });
-    else out.push({ text: part, bold: style.bold, italic: style.italic, mono: false });
+    else out.push({ text: part, bold: style.bold, italic: style.italic, mono });
   });
 }
 
@@ -448,14 +448,14 @@ function linesHeight(lines: LineBox[][], size: number, width: number): number {
 }
 
 /** Draw pre-built lines starting at (doc.x, doc.y), breaking pages as needed. */
-function drawLines(ctx: Ctx, lines: LineBox[][], opts: EmitOpts & { width: number }): void {
+function drawLines(ctx: Ctx, lines: LineBox[][], opts: EmitOpts & { width: number; paginate?: boolean }): void {
   const { doc, fonts } = ctx;
   const { size, color, width } = opts;
   const left = doc.x;
   let y = doc.y;
   for (const line of lines) {
     const { display, ascent, lineWidth, scale, pad, height } = measureLine(line, size, width);
-    if (y + height > PAGE_BOTTOM) {
+    if (opts.paginate !== false && y + height > PAGE_BOTTOM) {
       doc.addPage();
       y = MARGIN;
     }
@@ -594,43 +594,54 @@ function renderBlockquote(ctx: Ctx, token: Tokens.Blockquote): void {
 }
 
 function renderTable(ctx: Ctx, token: Tokens.Table): void {
-  const { doc, fonts } = ctx;
+  const { doc } = ctx;
   const cols = token.header.length;
   if (cols === 0) return;
   const colWidth = CONTENT_WIDTH / cols;
   const cellWidth = colWidth - 12;
   const drawRow = (cells: Tokens.TableCell[], header: boolean): void => {
-    const font = header ? fonts.bold : fonts.regular;
     const color = header ? INK_500 : INK_700;
     const size = header ? 9 : 10;
-    // Cells with math are pre-laid-out once, then measured and drawn from the
-    // same lines; plain cells keep pdfkit's own wrapping.
     const laid = cells.map((cell) => {
       const segs: Segment[] = [];
       flattenInline(cell.tokens, BASE_STYLE, segs);
       if (header) for (const s of segs) s.bold = true;
-      if (!segs.some((s) => s.math)) {
-        const text = segs.map((s) => s.text).join("");
-        return { text, height: doc.font(font).fontSize(size).heightOfString(text, { width: cellWidth }) };
-      }
-      const lines = mathLines(ctx, segs, size, color, cellWidth);
-      return { lines, height: linesHeight(lines, size, cellWidth) };
+      return mathLines(ctx, segs, size, color, cellWidth);
     });
-    const rowHeight = Math.max(...laid.map((c) => c.height), 14) + 8;
+    const rowHeight = Math.max(...laid.map((lines) => linesHeight(lines, size, cellWidth)), 14) + 8;
     breakIfTight(doc, rowHeight);
-    const top = doc.y;
-    laid.forEach((c, i) => {
-      const x = MARGIN + i * colWidth;
-      if (c.lines) {
-        doc.x = x;
+    // Draw the row in page-sized chunks, every cell advancing together, so a
+    // row taller than a page still keeps its columns and border aligned.
+    let top = doc.y;
+    let next = laid.map(() => 0);
+    for (;;) {
+      const avail = PAGE_BOTTOM - top - 8;
+      let chunkHeight = 14;
+      next = laid.map((lines, i) => {
+        let end = next[i];
+        let used = 0;
+        while (end < lines.length) {
+          const h = measureLine(lines[end], size, cellWidth).height;
+          // Always take one line on a fresh page, so an absurdly tall line can't stall us.
+          if (used + h > avail && !(used === 0 && top === MARGIN)) break;
+          used += h;
+          end++;
+        }
+        doc.x = MARGIN + i * colWidth;
         doc.y = top + 4;
-        drawLines(ctx, c.lines, { size, color, width: cellWidth, paragraphGap: 0 });
-      } else {
-        doc.font(font).fontSize(size).fillColor(color).text(c.text, x, top + 4, { width: cellWidth });
+        drawLines(ctx, lines.slice(next[i], end), { size, color, width: cellWidth, paragraphGap: 0, paginate: false });
+        chunkHeight = Math.max(chunkHeight, used);
+        return end;
+      });
+      if (next.every((end, i) => end >= laid[i].length)) {
+        top += chunkHeight + 8;
+        break;
       }
-    });
+      doc.addPage();
+      top = MARGIN;
+    }
     doc.x = MARGIN;
-    doc.y = top + rowHeight;
+    doc.y = top;
     doc
       .save()
       .lineWidth(0.7)
