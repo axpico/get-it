@@ -9,7 +9,8 @@
  */
 
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
-const LIST_ITEM = /^ {0,3}([-*+]|\d{1,9}[.)])[ \t]/;
+// Indent is checked separately: a nested item's marker can sit 4+ columns in.
+const LIST_ITEM = /^[ \t]*([-*+]|\d{1,9}[.)])[ \t]/;
 
 /** Leading indentation in columns (tab = 4). */
 function indentOf(line: string): number {
@@ -63,8 +64,10 @@ export function normalizeMathDelimiters(md: string): string {
       out += line;
     } else {
       inIndented = false;
-      const item = LIST_ITEM.exec(line);
-      if (item) listIndent = item[0].length;
+      // A marker is a (nested) list item unless it's indented far enough to
+      // be code; the item's content starts after the marker and its space.
+      const item = indent < codeIndent ? LIST_ITEM.exec(line) : null;
+      if (item) listIndent = indentOf(item[0].replace(/[^ \t]/g, " "));
       else if (!blank && indent === 0) listIndent = -1;
       prose.push(line);
     }

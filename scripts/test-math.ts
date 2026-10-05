@@ -49,6 +49,8 @@ eq("indented list continuation is prose", n("- item\n\n    see \\(x\\)"), "- ite
 eq("indented code after a paragraph is code", n("para\n\n    \\(x\\)"), "para\n\n    \\(x\\)");
 eq("CRLF display math on its own line", n("a\r\n\\[x\\]\r\nb"), "a\r\n$$\nx\n$$\r\nb");
 eq("code nested in a list item is code", n("- item\n\n      \\(x\\)"), "- item\n\n      \\(x\\)");
+eq("a nested item indented 4+ keeps its own indent", n("- parent\n    - child\n\n      see \\(x\\)"), "- parent\n    - child\n\n      see $x$");
+eq("code in a deeply nested item is code", n("- parent\n    - child\n\n          \\(x\\)"), "- parent\n    - child\n\n          \\(x\\)");
 eq("a top-level fence ends the list", n("- item\n\n```\nc\n```\n\n    \\(x\\)"), "- item\n\n```\nc\n```\n\n    \\(x\\)");
 eq("unclosed fence keeps the rest as code", n("````\n\\(x\\)\n```\n\\(y\\)"), "````\n\\(x\\)\n```\n\\(y\\)");
 
