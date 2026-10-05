@@ -34,10 +34,10 @@ export function normalizeMathDelimiters(md: string): string {
   let fence: string | null = null; // the open fence run, e.g. "```"
   let prevBlank = true;
   let inIndented = false;
-  // Inside a list item, indented lines are the item's continuation
-  // paragraphs; only 4+ columns past the item's content indent is code
-  // (CommonMark). -1 = not in a list.
-  let listIndent = -1;
+  // Content indents of the open list items, innermost last. Inside an item,
+  // indented lines are its continuation paragraphs; only 4+ columns past its
+  // content indent is code (CommonMark).
+  const lists: number[] = [];
   for (const line of md.split(/(?<=\n)/)) {
     const blank = line.trim() === "";
     if (fence) {
@@ -48,14 +48,20 @@ export function normalizeMathDelimiters(md: string): string {
     }
     const open = FENCE.exec(line);
     const indent = indentOf(line);
-    const codeIndent = listIndent < 0 ? 4 : listIndent + 4;
+    const marker = LIST_ITEM.exec(line);
+    // A line left of an item's content closes that item when it starts a new
+    // block: after a blank line, a fence, a sibling or outer marker, or any
+    // unindented line. (Erring toward closing only ever errs toward "code",
+    // which is never rewritten.)
+    if (!blank && (prevBlank || open || marker || indent === 0)) {
+      while (lists.length && indent < lists[lists.length - 1]) lists.pop();
+    }
+    const codeIndent = (lists[lists.length - 1] ?? 0) + 4;
     if (open) {
       flushProse();
       fence = open[1];
       out += line;
       inIndented = false;
-      // A fence left of the item's content ends the list.
-      if (indent < listIndent) listIndent = -1;
     } else if (!blank && (prevBlank || inIndented) && indent >= codeIndent) {
       flushProse();
       out += line;
@@ -64,11 +70,9 @@ export function normalizeMathDelimiters(md: string): string {
       out += line;
     } else {
       inIndented = false;
-      // A marker is a (nested) list item unless it's indented far enough to
-      // be code; the item's content starts after the marker and its space.
-      const item = indent < codeIndent ? LIST_ITEM.exec(line) : null;
-      if (item) listIndent = indentOf(item[0].replace(/[^ \t]/g, " "));
-      else if (!blank && indent === 0) listIndent = -1;
+      // A marker opens a (nested) item unless it's indented far enough to be
+      // code; the item's content starts after the marker and its space.
+      if (marker && indent < codeIndent) lists.push(indentOf(marker[0].replace(/[^ \t]/g, " ")));
       prose.push(line);
     }
     prevBlank = blank;
